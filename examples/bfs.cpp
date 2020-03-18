@@ -40,12 +40,19 @@ int main(int argc, char ** argv) {
 
 	double start_time = get_time();
 	int iteration = 0;
+	unsigned int i = 0;
 	while (active_vertices!=0) {
 		iteration++;
 		printf("%7d: %d\n", iteration, active_vertices);
 		std::swap(active_in, active_out);
 		active_out->clear();
 		graph.hint(parent);
+
+		// Print parent vector
+		for (i =0; i< parent.length; i++){
+			printf("%d  ", parent[i]);
+		}
+
 		active_vertices = graph.stream_edges<VertexId>([&](Edge & e){
 			if (parent[e.target]==-1) {
 				if (cas(&parent[e.target], -1, e.source)) {
@@ -59,6 +66,9 @@ int main(int argc, char ** argv) {
 	double end_time = get_time();
 
 	int discovered_vertices = graph.stream_vertices<VertexId>([&](VertexId i){
+		if (parent[i]!=-1){
+			printf("visited node >>( %d -> %d ) \n", start_vid, i);
+		}
 		return parent[i]!=-1;
 	});
 	printf("discovered %d vertices from %d in %.2f seconds.\n", discovered_vertices, start_vid, end_time - start_time);

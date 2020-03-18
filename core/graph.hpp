@@ -1,5 +1,6 @@
 /*
 Copyright (c) 2014-2015 Xiaowei Zhu, Tsinghua University
+Copyright (c) 2018 Hippolyte Barraud, Tsinghua University
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -17,16 +18,18 @@ Copyright (c) 2014-2015 Xiaowei Zhu, Tsinghua University
 #ifndef GRAPH_H
 #define GRAPH_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
 #include <unistd.h>
-#include <malloc.h>
+#ifdef USE_OPENMP
 #include <omp.h>
-#include <string.h>
+#endif
+#include <cstring>
 
 #include <thread>
 #include <vector>
+#include <functional>
 
 #include "core/constants.hpp"
 #include "core/type.hpp"
@@ -90,10 +93,14 @@ public:
 	}
 
 	void init(std::string path) {
+		int c;
 		this->path = path;
 
 		FILE * fin_meta = fopen((path+"/meta").c_str(), "r");
-		fscanf(fin_meta, "%d %d %ld %d", &edge_type, &vertices, &edges, &partitions);
+		c = fscanf(fin_meta, "%d %d %ld %d", &edge_type, &vertices, &edges, &partitions);
+		// debugging
+		printf("DEBUG > graph:init edge_type: %d \n vertices: %d \n edges : %ld \n partitions: %d \n", edge_type, vertices, edges, partitions);
+		// end
 		fclose(fin_meta);
 
 		if (edge_type==0) {
@@ -111,6 +118,9 @@ public:
 		}
 
 		memory_bytes = 1024l*1024l*1024l*1024l; // assume RAM capacity is very large
+		// debug
+		printf("DEBUG::graph:init memory bytes : %ld \n ", memory_bytes);
+		// end
 		partition_batch = partitions;
 		vertex_data_bytes = 0;
 
@@ -129,14 +139,15 @@ public:
 		column_offset = new long [partitions*partitions+1];
 		int fin_column_offset = open((path+"/column_offset").c_str(), O_RDONLY);
 		bytes = read(fin_column_offset, column_offset, sizeof(long)*(partitions*partitions+1));
-		assert(bytes==sizeof(long)*(partitions*partitions+1));
+		assert(bytes==static_cast<unsigned>(sizeof(long)*(partitions*partitions+1)));
 		close(fin_column_offset);
 
 		row_offset = new long [partitions*partitions+1];
 		int fin_row_offset = open((path+"/row_offset").c_str(), O_RDONLY);
 		bytes = read(fin_row_offset, row_offset, sizeof(long)*(partitions*partitions+1));
-		assert(bytes==sizeof(long)*(partitions*partitions+1));
+		assert(bytes==static_cast<unsigned>(sizeof(long)*(partitions*partitions+1)));
 		close(fin_row_offset);
+		if(c==-500) return;
 	}
 
 	Bitmap * alloc_bitmap() {
@@ -244,6 +255,9 @@ public:
 		std::function<void(std::pair<VertexId,VertexId> vid_range)> post_source_window = f_none_1,
 		std::function<void(std::pair<VertexId,VertexId> vid_range)> pre_target_window = f_none_1,
 		std::function<void(std::pair<VertexId,VertexId> vid_range)> post_target_window = f_none_1) {
+		printf("Number of partitions : %d \n ", partitions);
+		printf("Number of parallel threads : %d \n", parallelism);
+
 		if (bitmap==nullptr) {
 			for (int i=0;i<partitions;i++) {
 				should_access_shard[i] = true;
@@ -256,6 +270,8 @@ public:
 			for (int partition_id=0;partition_id<partitions;partition_id++) {
 				VertexId begin_vid, end_vid;
 				std::tie(begin_vid, end_vid) = get_partition_range(vertices, partitions, partition_id);
+				//printf("begin vid for partitions %d : %d \n", partition_id, begin_vid);
+				//printf("end vid for partitions %d : %d \n", partition_id, end_vid);
 				VertexId i = begin_vid;
 				while (i<end_vid) {
 					unsigned long word = bitmap->data[WORD_OFFSET(i)];
@@ -283,7 +299,7 @@ public:
 		}
 		int read_mode;
 		if (memory_bytes < total_bytes) {
-			read_mode = O_RDONLY | O_DIRECT;
+			read_mode = O_RDONLY | O_SYNC;
 			// printf("use direct I/O\n");
 		} else {
 			read_mode = O_RDONLY;
@@ -321,7 +337,7 @@ public:
 				}, ti);
 			}
 			fin = open((path+"/row").c_str(), read_mode);
-			posix_fadvise(fin, 0, 0, POSIX_FADV_SEQUENTIAL);
+			//posix_fadvise(fin, 0, 0, POSIX_FADV_SEQUENTIAL); //This is mostly useless on modern system
 			for (int i=0;i<partitions;i++) {
 				if (!should_access_shard[i]) continue;
 				for (int j=0;j<partitions;j++) {
@@ -350,7 +366,7 @@ public:
 			break;
 		case 1: // target oriented update
 			fin = open((path+"/column").c_str(), read_mode);
-			posix_fadvise(fin, 0, 0, POSIX_FADV_SEQUENTIAL);
+			posix_fadvise(fin, 0, 0, POSIX_FADV_SEQUENTIAL); //This is mostly useless on modern system
 
 			for (int cur_partition=0;cur_partition<partitions;cur_partition+=partition_batch) {
 				VertexId begin_vid, end_vid;
@@ -361,7 +377,7 @@ public:
 					end_vid = get_partition_range(vertices, partitions, cur_partition+partition_batch).first;
 				}
 				pre_source_window(std::make_pair(begin_vid, end_vid));
-				// printf("pre %d %d\n", begin_vid, end_vid);
+				printf("pre %d %d\n", begin_vid, end_vid);
 				threads.clear();
 				for (int ti=0;ti<parallelism;ti++) {
 					threads.emplace_back([&](int thread_id){
@@ -383,6 +399,7 @@ public:
 									continue;
 								}
 								if (bitmap==nullptr || bitmap->get_bit(e.source)) {
+									//printf("local value processed\n");
 									local_value += process(e);
 								}
 							}
@@ -414,12 +431,15 @@ public:
 				}
 				for (int i=0;i<parallelism;i++) {
 					tasks.push(std::make_tuple(-1, 0, 0));
+					//printf("push parallelism taks to queue\n");
 				}
 				for (int i=0;i<parallelism;i++) {
+					//printf("Waiting for the threads ...\n");
 					threads[i].join();
+					//printf("DONE\n");
 				}
 				post_source_window(std::make_pair(begin_vid, end_vid));
-				// printf("post %d %d\n", begin_vid, end_vid);
+				printf("post %d %d\n", begin_vid, end_vid);
 			}
 
 			break;
@@ -428,7 +448,7 @@ public:
 		}
 
 		close(fin);
-		// printf("streamed %ld bytes of edges\n", read_bytes);
+		printf("streamed %ld bytes of edges\n", read_bytes);
 		return value;
 	}
 };
